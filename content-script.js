@@ -96,41 +96,103 @@ var medias = [
 
 log("begins");
 
-const ignoreNodes = new Map();
+const ANNOT_ATTR = 'data-kiakoi';
+const EDITABLE_SELECTOR = 'input, textarea, select, [contenteditable]';
 
-let observer = new MutationObserver(mutations => {
-  for(let mutation of mutations) {
-    for(let addedNode of mutation.addedNodes) {
-      //log("ignoreNodes.length = " + ignoreNodes.size);
+// Non-prose tags mirrored from findAndReplaceDOMText preset (script/style/media/inputs...).
+const SKIP_TAGS = new Set([
+  'script', 'style', 'img', 'video', 'audio', 'canvas', 'svg', 'map', 'object',
+  'input', 'textarea', 'select', 'option', 'optgroup', 'button', 'br', 'hr', 'noscript',
+]);
 
-      if (ignoreNodes.get(addedNode) == undefined) {
-        ignoreNodes.set(addedNode, Date.now()); // over time... it's a leak?
-        replaceAll(addedNode);
-      }/* else {
-        log("Circular dependency detected");
-        ignoreNodes.delete(addedNode); // cannot delete otherwise because it's event based.
-        ignoreNodes.forEach( (value, key) => { 
-          if (Date.now() - value > 10) ignoreNodes.delete(key);
-        });
-      }*/
+function escapeRegExp(s) {
+  return String(s).replace(/([.*+?^=!:${}()|[\]/\\])/g, '\\$1');
+}
+
+// --- Single combined regex (1 DOM walk instead of ~80) ---
+// Longest names first so "France Inter" wins over "France 2"-style prefixes
+// and "Monde Diplomatique" wins over "Le Monde".
+const mediaLookup = new Map();
+const alternationParts = [];
+[...medias]
+  .sort((a, b) => b.name.length - a.name.length)
+  .forEach(media => {
+    for (const variant of [media.name, media.name.toUpperCase()]) {
+      if (!mediaLookup.has(variant)) {
+        mediaLookup.set(variant, media);
+        alternationParts.push(escapeRegExp(variant));
+      }
     }
-  }
-});
-observer.observe(document, { childList: true, subtree: true });
+  });
+// Re-sort parts longest-first (upper variants can be longer/shorter).
+alternationParts.sort((a, b) => b.length - a.length);
+// Guard both sides so "BFM" doesn't match inside "BFMTV" and "RTL" doesn't
+// match inside "ZRTL". Old code only blocked trailing [a-z0-9], letting
+// uppercase continuations (BFMTV) through and splitting words mid-acronym.
+const MEDIA_RE = new RegExp('(?<![A-Za-z0-9])(' + alternationParts.join('|') + ')(?![A-Za-z0-9]+)', 'gm');
 
+function isEditableElement(el) {
+  if (!el || el.nodeType !== 1) return false;
+  if (el.isContentEditable) return true;
+  try {
+    // closest() covers ancestors, so a node inside a contenteditable/input is skipped.
+    if (el.closest && el.closest(EDITABLE_SELECTOR)) return true;
+  } catch (e) { /* detached node */ }
+  return false;
+}
+
+function isInsideSkippedContext(node) {
+  // Walk *up* only: if the added node itself lives inside an annotation,
+  // an editable field, or a non-prose element, skip it entirely.
+  // (Annotated *descendants* are handled by filterElements, not here.)
+  let el = node.nodeType === 1 ? node : node.parentNode;
+  while (el) {
+    if (el.nodeType === 1) {
+      if (el.hasAttribute && el.hasAttribute(ANNOT_ATTR)) return true;
+      const tag = el.tagName && el.tagName.toLowerCase();
+      if (tag && SKIP_TAGS.has(tag)) return true;
+      if (el.isContentEditable) return true;
+    }
+    // Stop at document root; closest() check handles shadow edge cases above.
+    if (el === document.documentElement || el === document) break;
+    el = el.parentNode;
+  }
+  // Extra safety for detached-but-editable subtrees (e.g. paste fragments).
+  if (node.nodeType === 1 && isEditableElement(node)) return true;
+  return false;
+}
+
+function filterElements(el) {
+  if (!el || el.nodeType !== 1) return false;
+  const tag = el.tagName && el.tagName.toLowerCase();
+  if (tag && SKIP_TAGS.has(tag)) return false;
+  // BUG 1 FIX: never search inside our own annotations -> makes runs idempotent.
+  // hasAttribute covers the wrapper itself; closest covers nested children.
+  try {
+    if (el.hasAttribute && el.hasAttribute(ANNOT_ATTR)) return false;
+    if (el.closest && el.closest('[' + ANNOT_ATTR + ']')) return false;
+  } catch (e) { return false; }
+  // BUG 2 FIX: never touch user-editable content (paste targets, editors, docs).
+  if (isEditableElement(el)) return false;
+  return true;
+}
 
 function generateReplacement(portion, match, media) {
-  const node = document.createElement("span");
+  const node = document.createElement('span');
+  // BUG 1 FIX: mark the wrapper so future runs (observer re-fires, moved
+  // nodes, re-scans of an ancestor) skip it instead of annotating again.
+  node.setAttribute(ANNOT_ATTR, '1');
 
   const media_name = document.createTextNode(match[0] + ' ');
   const oli_start = document.createTextNode('(');
   const oli_name = document.createTextNode(' ' + media.owner.name + ' ');
   const oli_end = document.createTextNode(')');
 
-  const oli = document.createElement(isInLink(portion.node)?'span':'a');
+  const oli = document.createElement(isInLink(portion.node) ? 'span' : 'a');
   if (!isInLink(portion.node)) {
     oli.href = media.owner.url;
     oli.target = '_blank';
+    oli.setAttribute(ANNOT_ATTR, '1');
   }
 
   const icon_style = 'display: inline-block; width: 0.8em; height: 0.8em; background-color: orange; -webkit-mask: url(' + chrome.runtime.getURL('images/icon.svg') + ');';
@@ -147,21 +209,108 @@ function generateReplacement(portion, match, media) {
   node.appendChild(media_name);
   node.appendChild(oli);
 
-  ignoreNodes.set(portion.node, Date.now());
-  ignoreNodes.set(node, Date.now());
   return node;
 }
 
 function replaceAll(node) {
-  medias.forEach(media => {
+  if (!node) return;
+  // Skip text whose parent already tells us to ignore, and skip our own wrappers.
+  if (node.nodeType === 1 && node.hasAttribute && node.hasAttribute(ANNOT_ATTR)) return;
+  if (isInsideSkippedContext(node)) return;
+  // findAndReplaceDOMText requires an Element or Text node still in the doc.
+  if (node.nodeType === 3 && !node.parentNode) return;
+
+  MEDIA_RE.lastIndex = 0;
+  try {
     findAndReplaceDOMText(node, {
-      preset: 'prose',
+      // Keep prose segmentation (don't match across block borders) without
+      // inheriting the preset's filterElements (ours replaces it).
+      forceContext: findAndReplaceDOMText.NON_INLINE_PROSE || true,
+      filterElements: filterElements,
       portionMode: 'first',
-      find: new RegExp("(" + media.name + "|" + media.name.toUpperCase() + ")(?![a-z0-9]+)", 'gm'),
-      replace: (portion, match) => { return generateReplacement(portion, match, media) }
+      find: MEDIA_RE,
+      replace: (portion, match) => {
+        const media = mediaLookup.get(match[0]);
+        // Unknown variant (shouldn't happen): leave text untouched.
+        if (!media) return document.createTextNode(portion.text);
+        return generateReplacement(portion, match, media);
+      }
     });
-  });
+  } catch (e) {
+    log('replaceAll failed: ' + e);
+  }
 }
+
+// --- BUG 2 FIX: batched, non-reentrant observer ---
+// Old code ran ~80 full DOM walks *per added node*, synchronously, while
+// still observing (so our own inserts re-triggered work -> cascade/freeze
+// on paste into editors). Now: collect, dedupe, disconnect while working.
+let pending = new Set();
+let flushTimer = null;
+let isProcessing = false;
+
+function queueNode(n) {
+  if (!n) return;
+  if (n.nodeType !== 1 && n.nodeType !== 3) return;
+  if (n.nodeType === 1 && n.hasAttribute && n.hasAttribute(ANNOT_ATTR)) return;
+  pending.add(n);
+  scheduleFlush();
+}
+
+function scheduleFlush() {
+  if (flushTimer) return;
+  flushTimer = setTimeout(() => {
+    flushTimer = null;
+    flush();
+  }, 200);
+}
+
+function flush() {
+  if (isProcessing || pending.size === 0) return;
+  const nodes = [...pending];
+  pending.clear();
+
+  // Dedupe: drop any node whose ancestor is also queued (ancestor walk covers it).
+  const queued = new Set(nodes);
+  const roots = nodes.filter(n => {
+    let p = n.parentNode;
+    while (p) {
+      if (queued.has(p)) return false;
+      if (p === document || p === document.documentElement) break;
+      p = p.parentNode;
+    }
+    return true;
+  });
+
+  isProcessing = true;
+  observer.disconnect();
+  try {
+    for (const n of roots) {
+      // Node removed before flush (common on paste/move) -> nothing to do.
+      if (n.isConnected === false) continue;
+      if (isInsideSkippedContext(n)) continue;
+      replaceAll(n);
+    }
+  } finally {
+    isProcessing = false;
+    observer.observe(observeTarget(), { childList: true, subtree: true });
+  }
+}
+
+function observeTarget() {
+  return document.body || document.documentElement;
+}
+
+let observer = new MutationObserver(mutations => {
+  if (isProcessing) return;
+  for (let mutation of mutations) {
+    for (let addedNode of mutation.addedNodes) {
+      queueNode(addedNode);
+    }
+  }
+});
+observer.observe(observeTarget(), { childList: true, subtree: true });
+
 
 var body = document.getElementsByTagName('body');
 
